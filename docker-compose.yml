@@ -1,0 +1,114 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: forma
+      POSTGRES_USER: forma
+      POSTGRES_PASSWORD: forma
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=en_US.utf8
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-formaadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-this-strong}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9000/minio/health/ready || curl -fsS http://localhost:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-formaadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-this-strong}
+      S3_BUCKET: ${S3_BUCKET:-forma}
+    entrypoint: >
+      /bin/sh -c '
+      i=0;
+      until /usr/bin/mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"; do
+        i=$$((i+1));
+        if [ $$i -ge 60 ]; then
+          echo "minio-init: cannot reach minio after 60 attempts";
+          exit 1;
+        fi;
+        sleep 1;
+      done;
+      /usr/bin/mc mb -p local/$${S3_BUCKET} || true;
+      /usr/bin/mc anonymous set download local/$${S3_BUCKET}/projects || true;
+      exit 0;
+      '
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+  web:
+    build:
+      context: .
+      target: dev
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      mailpit:
+        condition: service_started
+    environment:
+      NODE_ENV: development
+      NEXTAUTH_URL: http://localhost:3000
+      NEXT_PUBLIC_SITE_URL: http://localhost:3000
+      NEXTAUTH_SECRET: replace-with-a-long-random-secret
+      DATABASE_URL: postgresql://forma:forma@db:5432/forma?schema=public
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+      SMTP_SECURE: "false"
+      SMTP_FROM: Forma <noreply@forma.ir>
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: ${S3_BUCKET:-forma}
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-formaadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-change-this-strong}
+      S3_PUBLIC_BASE_URL: http://localhost:9000/${S3_BUCKET:-forma}
+      RATE_LIMIT_DISABLED: "true"
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/app
+      - /app/node_modules
+    command: sh -c "npm run db:generate && npm run db:migrate && npm run db:seed && npm run dev"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health || curl -fsS http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  postgres_data:
+  minio_data:
